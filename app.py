@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -14,6 +15,8 @@ MODEL_PATH = BASE_DIR / "svc_genetic_telco.pkl"
 RESULTS_DIR = BASE_DIR / "resultados"
 
 st.set_page_config(page_title="NexoRetain | Retención inteligente", page_icon="✦", layout="wide")
+px.defaults.template = "plotly_dark"
+px.defaults.color_discrete_sequence = ["#2DD4BF", "#60A5FA", "#F59E0B", "#FB7185", "#A78BFA"]
 st.markdown("""
 <style>
  .stApp {background: #0B1324; color: #E9EFFD;}
@@ -30,6 +33,9 @@ st.markdown("""
    padding:20px; min-height:135px;}
  .brand-card h4 {color:#F1F7FF; margin:0 0 8px;}
  .brand-card p {color:#B8C8E3; margin:0;}
+ [data-testid="stTabs"] [role="tab"] {font-weight:650;}
+ [data-testid="stDataFrame"] {border: 1px solid #2D4564; border-radius: 10px;}
+ [data-testid="stMetricValue"] {color:#F6FBFF;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -153,10 +159,46 @@ def evaluar_campana(datos, capacidad, eficacia, valor, costo, criterio):
     puntuados["Valor esperado ($)"] = (
         puntuados["P_Abandono"] * eficacia * valor - costo
     ).round(2)
-    columna = "P_Abandono" if criterio == "Mayor riesgo" else "Valor esperado ($)"
+    if criterio == "Mayor cargo mensual":
+        if "MonthlyCharges" not in puntuados.columns:
+            raise ValueError("Falta MonthlyCharges para priorizar por facturación.")
+        columna = "MonthlyCharges"
+    elif criterio == "Mayor riesgo":
+        columna = "P_Abandono"
+    elif criterio == "Mayor valor esperado":
+        columna = "Valor esperado ($)"  # Coincide con riesgo si se usa el mismo valor para todos.
+    else:
+        raise ValueError(f"Criterio no reconocido: {criterio}")
     puntuados = puntuados.sort_values([columna, "P_Abandono"], ascending=False, kind="stable")
     contactos = puntuados.head(capacidad).copy()
     return puntuados, contactos, float(contactos["Valor esperado ($)"].sum())
+
+
+def calcular_economia_cartera(contactos, eficacia, valor, costo, costo_fijo):
+    """Proyección ilustrativa sobre scores, sin atribuir retención real."""
+    if not 0 <= eficacia <= 1 or min(valor, costo, costo_fijo) < 0:
+        raise ValueError("Los supuestos económicos no son válidos.")
+    probabilidades = pd.to_numeric(contactos["P_Abandono"], errors="raise").to_numpy()
+    if not np.isfinite(probabilidades).all() or ((probabilidades < 0) | (probabilidades > 1)).any():
+        raise ValueError("Las puntuaciones deben estar entre 0 y 1.")
+    retenidos_estimados = float(probabilidades.sum() * eficacia)
+    ingreso_estimado = retenidos_estimados * valor
+    costo_variable = len(contactos) * costo
+    total_costos = costo_variable + costo_fijo
+    umbral = total_costos / (probabilidades.sum() * valor) if probabilidades.sum() * valor else np.inf
+    return {"retenidos": retenidos_estimados, "valor": ingreso_estimado,
+            "costos": total_costos, "balance": ingreso_estimado - total_costos,
+            "eficacia_equilibrio": umbral}
+
+
+def proyectar_capacidades(cartera_ordenada, eficacia, valor, costo, costo_fijo):
+    """Curva calculada de forma vectorizada para todas las capacidades posibles."""
+    scores = cartera_ordenada["P_Abandono"].to_numpy(dtype=float)
+    n = np.arange(1, len(scores) + 1, dtype=int)
+    ingresos = np.cumsum(scores) * eficacia * valor
+    gastos = n * costo + costo_fijo
+    return pd.DataFrame({"Contactos": n, "Valor estimado ($)": ingresos,
+                         "Costo total ($)": gastos, "Balance proyectado ($)": ingresos - gastos})
 
 
 def agrupar_contribuciones_shap(nombres, valores, originales):
@@ -201,7 +243,7 @@ def simular_diferencia_comercial(matriz_base, matriz_nueva, efectividad, valor_r
 
 st.markdown("""<div class="brand-hero"><div class="brand-tag">✦ NEXORETAIN · CUSTOMER INTELLIGENCE</div>
 <h1>Clientes que entiendes. Relaciones que conservas.</h1>
-<p>Analítica de abandono, priorización comercial y decisiones explicables con SVC genético.</p></div>""",
+<p>Conoce el riesgo de abandono, organiza tu cartera y planifica campañas de retención.</p></div>""",
 unsafe_allow_html=True)
 
 if not DATA_PATH.exists():
@@ -215,8 +257,8 @@ pagina = st.sidebar.radio(
     "✦ NexoRetain | Navegación",
     ["Inicio", "EDA", "Centro de retención", "Model Performance", "Prediction & Explainability", "Business Application"],
 )
-st.sidebar.caption("SVC + Genetic Optimization · Telco Customer Churn")
-st.sidebar.caption("Demostración académica · Datos históricos")
+st.sidebar.caption("Inteligencia de retención · NexoRetain")
+st.sidebar.caption("Modo demostración con datos históricos")
 
 
 if pagina == "Inicio":
@@ -252,7 +294,7 @@ if pagina == "Inicio":
 
 
 elif pagina == "EDA":
-    st.header("📊 Exploratory Data Analysis")
+    st.header("📊 Exploración de clientes")
     st.write("Explora segmentos de clientes y observa su abandono histórico.")
     c1, c2 = st.columns(2)
     contrato = c1.selectbox("Tipo de contrato", ["Todos"] + sorted(df["Contract"].dropna().unique().tolist()))
@@ -366,8 +408,8 @@ elif pagina == "Centro de retención":
         valor = a.number_input("Valor neto supuesto por cliente retenido ($)", min_value=0.0, value=120.0, step=10.0)
         costo = b.number_input("Costo supuesto por contacto ($)", min_value=0.0, value=8.0, step=1.0)
         eficacia = c.slider("Efectividad hipotética de la oferta (%)", 0, 100, 20) / 100
-        criterio = st.radio("Ordenar contactos por", ["Mayor riesgo", "Mayor valor esperado"], horizontal=True,
-                           help="El segundo criterio incorpora los supuestos económicos. No representa un valor comprobado.")
+        criterio = st.radio("Ordenar contactos por", ["Mayor riesgo", "Mayor cargo mensual"], horizontal=True,
+                           help="El cargo mensual es un dato registrado, no equivale al margen real del cliente.")
         ordenados, contactos, beneficio = evaluar_campana(resultados, capacidad, eficacia, valor, costo, criterio)
         monto_contactos = capacidad * costo
         potenciales = float((contactos["P_Abandono"] * eficacia).sum())
@@ -396,9 +438,9 @@ elif pagina == "Centro de retención":
 
 
 elif pagina == "Model Performance":
-    st.header("🔬 Laboratorio del modelo")
-    st.write("Evidencia técnica para comparar calidad predictiva, costos de errores y esfuerzo de optimización.")
-    st.info("Estos resultados corresponden a VALIDACIÓN y se muestran separados de cualquier evaluación de test final.")
+    st.header("📈 Rendimiento de NexoRetain")
+    st.write("Conoce qué tan bien identifica clientes en riesgo y cuántas alertas necesitaría revisar el equipo.")
+    st.caption("Resultados históricos de validación. El desempeño con una cartera nueva debe comprobarse antes de tomar decisiones reales.")
 
     # Respaldo si aún no se ha exportado el CSV del notebook.
     metricas_respaldo = pd.DataFrame({
@@ -425,86 +467,150 @@ elif pagina == "Model Performance":
     base = resumen_matriz_confusion(matrices["SVC Base"])
     v2 = resumen_matriz_confusion(matrices["Genético V2"])
 
-    tab1, tab2, tab3 = st.tabs(["Comparación de modelos", "Optimización", "Evaluación y límites"])
+    tab1, tab2, tab3 = st.tabs(["Resumen de rendimiento", "Comparación de modelos", "Ficha técnica"])
     with tab1:
-        st.caption(f"{len(metricas)} modelos comparados en el mismo conjunto de validación. "
-                   "Grid Search, Random Search, TPE y NSGA-II se leen de resultados/metricas_validacion.csv.")
+        st.subheader("Detección de abandono")
         a, b, c, d = st.columns(4)
-        a.metric("Recall V2", f"{v2['Recall']:.1%}", f"{(v2['Recall'] - base['Recall']) * 100:+.1f} puntos vs base")
-        b.metric("Abandonos adicionales detectados", f"+{v2['VP'] - base['VP']}")
-        c.metric("Falsas alarmas adicionales", f"+{v2['FP'] - base['FP']}", delta_color="inverse")
-        d.metric("F1 de validación V2", "0.6392")
+        a.metric("Abandonos identificados", f"{v2['Recall']:.1%}",
+                 f"{(v2['Recall'] - base['Recall']) * 100:+.1f} puntos frente al inicial")
+        b.metric("Casos adicionales detectados", f"+{v2['VP'] - base['VP']}")
+        c.metric("Alertas adicionales que no eran abandono", f"+{v2['FP'] - base['FP']}", delta_color="inverse")
+        d.metric("Equilibrio de detección (F1)", "0.6392")
 
-        st.dataframe(metricas.style.format({x: "{:.4f}" for x in metricas.columns if x != "Modelo"}),
-                     hide_index=True, use_container_width=True)
-        metrica = st.selectbox("Comparar métrica", ["F1", "Recall", "Precision", "Accuracy", "ROC-AUC"])
-        fig = px.bar(metricas, x="Modelo", y=metrica, color="Modelo", text_auto=".4f",
-                     title=f"Resultados de validación: {metrica}", range_y=[0, 1])
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("¿Qué tipos de errores comete cada modelo?")
+        st.write("En una muestra histórica con **374 clientes que sí abandonaron**, "
+                 "NexoRetain V2 identificó **287**. El modelo inicial identificó **192**.")
         c1, c2 = st.columns(2)
         with c1:
-            mostrar_matriz(matrices["SVC Base"], "SVC Base (validación)")
+            st.markdown("**De quienes realmente abandonaron**")
+            graf = go.Figure()
+            nombres = ["Modelo inicial", "NexoRetain V2"]
+            graf.add_bar(name="Abandonos identificados", y=nombres, x=[base["VP"], v2["VP"]],
+                         orientation="h", marker_color="#2DD4BF", text=[base["VP"], v2["VP"]],
+                         textposition="inside")
+            graf.add_bar(name="No detectados", y=nombres, x=[base["FN"], v2["FN"]],
+                         orientation="h", marker_color="#FB7185", text=[base["FN"], v2["FN"]],
+                         textposition="inside")
+            graf.update_layout(barmode="stack", height=310, template="plotly_dark",
+                               xaxis_title="Clientes que sí abandonaron", yaxis_title="",
+                               legend=dict(orientation="h", y=-0.3),
+                               margin=dict(l=20, r=10, t=20, b=60),
+                               paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32")
+            st.plotly_chart(graf, use_container_width=True)
         with c2:
-            mostrar_matriz(matrices["Genético V2"], "SVC Genético V2 (validación)")
-        st.caption("VP: abandono detectado; FN: abandono no detectado; FP: alerta para quien no abandonó; VN: cliente correctamente identificado como no abandono.")
-        st.warning("V2 identifica 95 abandonos más, pero genera 150 falsas alarmas más en las mismas 1.409 observaciones de validación. "
-                   "No es mejor en todas las métricas: baja Accuracy y Precision respecto al modelo base.")
-        st.markdown("**Criterio de selección:** elegimos V2 para un escenario en el que detectar abandonos es prioritario. "
-                    "La decisión empresarial debe contrastar el valor de recuperar clientes con el costo de intervenir sobre falsas alarmas.")
+            st.markdown("**Alertas que recibiría el equipo comercial**")
+            alertas = go.Figure()
+            alertas.add_bar(name="Abandono real", y=nombres, x=[base["VP"], v2["VP"]],
+                            orientation="h", marker_color="#2DD4BF", text=[base["VP"], v2["VP"]],
+                            textposition="inside")
+            alertas.add_bar(name="Alerta incorrecta", y=nombres, x=[base["FP"], v2["FP"]],
+                            orientation="h", marker_color="#FBBF24", text=[base["FP"], v2["FP"]],
+                            textposition="inside")
+            alertas.update_layout(barmode="stack", height=310, template="plotly_dark",
+                                  xaxis_title="Clientes señalados para contactar", yaxis_title="",
+                                  legend=dict(orientation="h", y=-0.3),
+                                  margin=dict(l=20, r=10, t=20, b=60),
+                                  paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32")
+            st.plotly_chart(alertas, use_container_width=True)
+        st.info("**Lectura comercial:** mayor cobertura de abandonos implica más oportunidades de contacto, "
+                "pero también más casos que el equipo revisaría sin que existiera abandono. "
+                "El costo real depende de cada campaña.")
+        st.caption("Ambas comparaciones utilizan los mismos 1.409 registros de validación; no son resultados de una operadora conectada.")
 
     with tab2:
-        st.subheader("Evolución de la optimización genética")
-        genetica = pd.DataFrame({
-            "Experimento": ["V1", "V2"],
-            "Generaciones": [5, 10], "Población": [6, 10],
-            "F1 medio CV": [0.5895, 0.6225], "Tiempo (s)": [46.55, 166.32],
-        })
-        st.dataframe(genetica, hide_index=True, use_container_width=True)
-        st.caption("F1 medio de validación cruzada (fitness), no F1 del conjunto de validación de la primera pestaña. "
-                   "Los tiempos se midieron en ejecuciones diferentes y dependen del equipo.")
-        st.write("**Mejor configuración V2:** `C = 0.3162`, `gamma = 0.3162`, `class_weight = balanced`.")
-        historial = cargar_csv_opcional("fitness_ga_v2.csv")
-        if historial is not None and {"Generacion", "F1"}.issubset(historial.columns):
-            st.plotly_chart(px.line(historial, x="Generacion", y="F1", markers=True,
-                                   title="Evolución registrada del fitness (F1)"), use_container_width=True)
-        else:
-            st.info("Para mostrar la evolución genética, exporta `resultados/fitness_ga_v2.csv` desde el notebook con columnas `Generacion` y `F1`.")
-
-        st.subheader("Otras estrategias solicitadas en la tarea")
-        comparacion = cargar_csv_opcional("comparacion_optimizacion.csv")
-        if comparacion is not None:
-            st.dataframe(comparacion, hide_index=True, use_container_width=True)
-            st.caption("Resultados importados del notebook. Comprueba que todas las estrategias usaron particiones, métricas y presupuestos comparables.")
-        else:
-            st.warning("Pendiente: Grid Search, Random Search, TPE/Hyperband y optimización multiobjetivo (NSGA-II u otra). "
-                       "Cuando estén ejecutados, exporta `resultados/comparacion_optimizacion.csv` para mostrarlos aquí.")
-        pareto = cargar_csv_opcional("pareto_front.csv")
-        if pareto is not None:
-            numericas = pareto.select_dtypes(include="number").columns.tolist()
-            if len(numericas) >= 2:
-                st.plotly_chart(px.scatter(pareto, x=numericas[0], y=numericas[1],
-                                           title="Resultados de optimización multiobjetivo"), use_container_width=True)
-            else:
-                st.info("El CSV de Pareto debe incluir al menos dos columnas numéricas de objetivos.")
+        st.subheader("Comparador de rendimiento")
+        st.write("Explora siete alternativas evaluadas con la misma partición de validación.")
+        etiquetas = {"F1": "Equilibrio entre detección y precisión (F1)",
+                     "Recall": "Cobertura de abandonos (Recall)",
+                     "Precision": "Precisión de las alertas (Precision)",
+                     "Accuracy": "Aciertos generales (Accuracy)",
+                     "ROC-AUC": "Capacidad de discriminación (ROC-AUC)"}
+        seleccion = st.selectbox("Indicador que deseas comparar", list(etiquetas),
+                                format_func=lambda clave: etiquetas[clave])
+        orden = metricas.sort_values(seleccion, ascending=True).copy()
+        colores = ["#2DD4BF" if m == "Genético V2" else "#55759A" for m in orden["Modelo"]]
+        fig = go.Figure(go.Bar(
+            x=orden[seleccion], y=orden["Modelo"], orientation="h", marker_color=colores,
+            text=orden[seleccion].map(lambda v: f"{v:.1%}"), textposition="outside",
+            customdata=orden[["Precision", "Recall", "F1"]].to_numpy(),
+            hovertemplate="%{y}<br>Indicador: %{x:.1%}<br>Precisión: %{customdata[0]:.1%}"
+                          "<br>Detección: %{customdata[1]:.1%}<br>F1: %{customdata[2]:.3f}<extra></extra>"))
+        fig.update_layout(template="plotly_dark", height=430, showlegend=False,
+                          xaxis=dict(title="Resultado en validación", range=[0, 1.08], tickformat=".0%"),
+                          yaxis_title="", margin=dict(l=20, r=45, t=20, b=50),
+                          paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Verde: motor predictivo utilizado por NexoRetain. "
+                   "El indicador superior varía según la métrica: no existe una única alternativa ganadora en todo.")
+        with st.expander("Ver tabla completa de los siete modelos"):
+            st.dataframe(metricas.style.format({x: "{:.3f}" for x in metricas.columns if x != "Modelo"}),
+                         hide_index=True, use_container_width=True)
+        st.markdown("**Cómo interpretar los resultados**")
+        a, b, c = st.columns(3)
+        a.write("**Cobertura (Recall):** de los clientes que abandonaron, cuántos identificamos.")
+        b.write("**Precisión:** de las alertas emitidas, cuántas correspondían a abandono real.")
+        c.write("**F1:** resume ambas métricas para ayudar a comparar alternativas.")
 
     with tab3:
-        st.subheader("Evaluación final independiente")
+        st.subheader("Evaluación independiente")
         test = cargar_csv_opcional("metricas_test.csv")
-        if test is not None:
-            st.dataframe(test, hide_index=True, use_container_width=True)
-            st.caption("Métricas de test importadas desde el notebook; no deben utilizarse para elegir hiperparámetros.")
+        if test is not None and {"Modelo", "Recall", "F1"}.issubset(test.columns):
+            fila_test = test.iloc[0]
+            a, b = st.columns(2)
+            a.metric("Cobertura en prueba final", f"{float(fila_test['Recall']):.1%}")
+            b.metric("F1 en prueba final", f"{float(fila_test['F1']):.3f}")
+            with st.expander("Ver todas las métricas de prueba"):
+                st.dataframe(test, hide_index=True, use_container_width=True)
         else:
-            st.warning("Falta `resultados/metricas_test.csv`. No mostramos métricas finales de prueba inventadas.")
-        with st.expander("Transparencia y límites del modelo", expanded=True):
+            st.info("No está disponible el archivo de evaluación final.")
+        st.caption("La prueba final se mantiene separada de los resultados usados para seleccionar el modelo.")
+
+        with st.expander("Proceso de entrenamiento y optimización", expanded=False):
+            st.markdown("**Optimización genética del modelo final**")
+            genetica = pd.DataFrame({
+                "Experimento": ["V1", "V2"],
+                "Generaciones": [5, 10], "Población": [6, 10],
+                "F1 medio CV": [0.5895, 0.6225], "Tiempo (s)": [46.55, 166.32],
+            })
+            st.dataframe(genetica, hide_index=True, use_container_width=True)
+            st.caption("F1 medio de validación cruzada y tiempos medidos en ejecuciones distintas.")
+            st.write("**Parámetros del motor final:** C = 0.3162, gamma = 0.3162, class_weight = balanced.")
+            historial = cargar_csv_opcional("fitness_ga_v2.csv")
+            if historial is not None and {"Generacion", "F1"}.issubset(historial.columns):
+                valores = pd.to_numeric(historial["F1"], errors="coerce").dropna()
+                if valores.nunique() <= 1 and not valores.empty:
+                    st.info(f"El mejor F1 registrado se mantuvo en {valores.iloc[0]:.4f} en todas las generaciones. "
+                            "El historial no demuestra una mejora progresiva, por lo que omitimos una línea plana.")
+                elif not valores.empty:
+                    fig_fit = px.line(historial, x="Generacion", y="F1", markers=True,
+                                      title="Mejor resultado registrado por generación")
+                    fig_fit.update_layout(yaxis_title="F1 medio (CV)")
+                    st.plotly_chart(fig_fit, use_container_width=True)
+                st.dataframe(historial, hide_index=True, use_container_width=True)
+            comparacion = cargar_csv_opcional("comparacion_optimizacion.csv")
+            if comparacion is not None:
+                st.markdown("**Otras estrategias de búsqueda**")
+                st.dataframe(comparacion, hide_index=True, use_container_width=True)
+
+        with st.expander("Explorar soluciones de optimización multiobjetivo", expanded=False):
+            pareto = cargar_csv_opcional("pareto_front.csv")
+            if pareto is not None and {"F1", "Recall"}.issubset(pareto.columns):
+                frente = px.scatter(pareto, x="Recall", y="F1", hover_data=[c for c in ["C", "gamma"] if c in pareto],
+                                    title="Alternativas evaluadas: cobertura frente a F1")
+                frente.update_traces(marker=dict(size=13, color="#2DD4BF"))
+                frente.update_layout(xaxis_title="Cobertura (Recall)", yaxis_title="Equilibrio (F1)",
+                                     paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32")
+                st.plotly_chart(frente, use_container_width=True)
+                st.caption("Cada punto es una configuración registrada durante la búsqueda multiobjetivo.")
+            else:
+                st.info("No hay datos suficientes para explorar la optimización multiobjetivo.")
+
+        with st.expander("Condiciones y límites de interpretación", expanded=False):
             st.markdown("""
-            - Las cifras mostradas en las pestañas anteriores proceden de validación; el test final es independiente.
-            - El SVC se optimizó con PyGAD para F1 de la clase Churn.
-            - El modelo genera falsos positivos y falsos negativos; ambos tienen consecuencias comerciales.
-            - Las probabilidades podrían no estar calibradas en una cartera de otra empresa.
-            - Una evaluación histórica no demuestra ganancias ni retención incremental reales.
-            - SHAP/LIME explican predicciones, pero no establecen causalidad.
+            - Los indicadores provienen de datos históricos y pueden cambiar en otra cartera.
+            - Existen alertas incorrectas y abandonos que el modelo no detectará.
+            - La probabilidad estimada puede requerir calibración antes de su aplicación comercial.
+            - Identificar clientes en riesgo no demuestra que una oferta consiga retenerlos.
+            - Las explicaciones locales del modelo no prueban relaciones causales.
             """)
 
 
@@ -624,125 +730,129 @@ elif pagina == "Prediction & Explainability":
 
 
 elif pagina == "Business Application":
-    st.header("💼 NexoRetain | Caso de negocio")
-    st.write("Una propuesta de inteligencia comercial para proveedores de telecomunicaciones: "
-             "detectar clientes en riesgo, priorizar contactos y evaluar escenarios de retención.")
-    st.info("Las métricas predictivas provienen del conjunto histórico de **validación**. "
-            "Los precios, costos, retención lograda y beneficios que siguen son **hipótesis editables**, "
-            "no resultados económicos observados.")
+    st.header("💼 Planificador comercial")
+    st.write("Calcula el presupuesto de una campaña y descubre cuántos clientes puede atender tu equipo.")
 
-    simulador, producto, venta = st.tabs(["Simulador económico", "Producto y compradores", "Oferta y riesgos"])
-    with simulador:
-        st.subheader("¿En qué condiciones conviene utilizar el modelo V2?")
-        st.caption("Comparación sobre 1.409 registros de validación. El escenario supone contactar "
-                   "a todos los clientes clasificados como Churn por cada modelo.")
-        c1, c2, c3, c4 = st.columns(4)
-        valor = c1.number_input("Valor neto supuesto por abandono evitado ($)", min_value=0.0,
-                                max_value=10000.0, value=200.0, step=25.0)
-        costo = c2.number_input("Costo de cada contacto ($)", min_value=0.0,
-                                max_value=500.0, value=8.0, step=1.0)
-        eficacia = c3.slider("Efectividad hipotética de retención (%)", 0, 100, 25) / 100
-        tarifa = c4.number_input("Costo adicional del servicio en este ciclo ($)",
-                                 min_value=0.0, max_value=100000.0, value=300.0, step=50.0)
+    cartera_activa = st.session_state.get("cartera_puntuada")
+    if isinstance(cartera_activa, pd.DataFrame) and not cartera_activa.empty:
+        datos_plan = cartera_activa.copy()
+        st.success(f"Cartera activa: {len(datos_plan):,} clientes analizados en el Centro de retención.")
+    else:
+        st.info("Vista de demostración: analizaremos 200 registros históricos. "
+                "Para planificar con tu propio CSV, impórtalo antes en el Centro de retención.")
+        try:
+            modelo = obtener_modelo()
+            datos_plan = puntuar_cartera(df.head(200).drop(columns=["Churn"]), modelo, columnas_entrada)
+        except Exception as exc:
+            st.error(f"No se pudo preparar la cartera de demostración: {exc}")
+            st.stop()
 
-        base_cm = [[948, 87], [182, 192]]
-        v2_cm = [[798, 237], [87, 287]]
-        r = simular_diferencia_comercial(base_cm, v2_cm, eficacia, valor, costo, tarifa)
-        a, b, c, d = st.columns(4)
-        a.metric("Abandonos adicionales detectados", f"+{r['tp_extra']}")
-        b.metric("Falsas alarmas adicionales", f"+{r['fp_extra']}", delta_color="inverse")
-        c.metric("Contactos adicionales netos", f"+{r['contactos_extra']}")
-        d.metric("Balance incremental hipotético", f"${r['balance']:,.2f}")
+    st.caption("La cartera y sus estimaciones se procesan en esta sesión. "
+               "Las cantidades económicas son escenarios configurables, no ingresos comprobados.")
 
-        st.markdown("**Cálculo del escenario:**")
-        st.latex(r"\Delta B = 95\times e\times V - 245\times C - T")
-        st.caption("e = efectividad hipotética de la campaña; V = valor neto supuesto de retener "
-                   "un cliente; C = costo por contacto; T = costo adicional del servicio. "
-                   "Incluimos los 245 contactos netos adicionales (95 VP + 150 FP), "
-                   "no solamente las falsas alarmas.")
+    st.subheader("Configuración de campaña")
+    c1, c2, c3 = st.columns(3)
+    capacidad = c1.slider("Contactos que puede realizar el equipo", min_value=1,
+                          max_value=len(datos_plan), value=min(50, len(datos_plan)),
+                          help="Número máximo de clientes a contactar en este ciclo.", key="com_capacidad")
+    criterio = c2.selectbox("Criterio de priorización", ["Mayor riesgo", "Mayor cargo mensual"],
+                            key="com_criterio")
+    eficacia_pct = c3.slider("Efectividad estimada de la campaña (%)", 0, 100, 25,
+                              help="Supuesto editable: proporción de posibles abandonos que se evitarían con la intervención.",
+                              key="com_eficacia")
 
-        if r["balance"] >= 0:
-            st.success("Este escenario sería favorable con los supuestos seleccionados. "
-                       "Debe comprobarse en un piloto real antes de justificar la compra.")
+    c1, c2, c3 = st.columns(3)
+    valor = c1.number_input("Valor neto por cliente retenido ($)", min_value=0.0,
+                            max_value=100000.0, value=200.0, step=25.0, key="com_valor")
+    costo = c2.number_input("Costo por contacto ($)", min_value=0.0,
+                            max_value=10000.0, value=8.0, step=1.0, key="com_costo")
+    costo_fijo = c3.number_input("Costo fijo de la campaña ($)", min_value=0.0,
+                                 max_value=1000000.0, value=300.0, step=50.0, key="com_fijo")
+    eficacia = eficacia_pct / 100
+
+    ordenados, seleccionados, _ = evaluar_campana(datos_plan, capacidad, eficacia, valor, costo, criterio)
+    economia = calcular_economia_cartera(seleccionados, eficacia, valor, costo, costo_fijo)
+    a, b, c, d = st.columns(4)
+    a.metric("Contactos planificados", f"{capacidad:,}")
+    b.metric("Costo total presupuestado", f"${economia['costos']:,.0f}")
+    c.metric("Retenciones estimadas", f"{economia['retenidos']:.1f}")
+    d.metric("Balance proyectado", f"${economia['balance']:,.0f}")
+
+    tab_evolucion, tab_sensibilidad, tab_clientes = st.tabs(
+        ["Presupuesto por capacidad", "Escenarios de campaña", "Contactos seleccionados"])
+
+    with tab_evolucion:
+        st.subheader("¿Cómo cambia el presupuesto si contactamos a más clientes?")
+        st.write("Explora los valores con el cursor. La línea vertical indica la capacidad seleccionada.")
+        curva = proyectar_capacidades(ordenados, eficacia, valor, costo, costo_fijo)
+        grafico = go.Figure()
+        for columna, color in [
+            ("Valor estimado ($)", "#2DD4BF"),
+            ("Costo total ($)", "#FB7185"),
+            ("Balance proyectado ($)", "#60A5FA"),
+        ]:
+            grafico.add_trace(go.Scatter(x=curva["Contactos"], y=curva[columna],
+                                         name=columna, mode="lines", line=dict(color=color, width=3),
+                                         hovertemplate="%{x} contactos<br>$%{y:,.0f}<extra>" + columna + "</extra>"))
+        grafico.add_vline(x=capacidad, line_dash="dot", line_color="#FBBF24",
+                          annotation_text="Capacidad actual", annotation_position="top")
+        grafico.add_hline(y=0, line_dash="dash", line_color="#94A3B8")
+        grafico.update_layout(template="plotly_dark", height=450, hovermode="x unified",
+                              xaxis_title="Clientes contactados", yaxis_title="Importe estimado ($)",
+                              legend_title="Concepto", margin=dict(t=35, b=40),
+                              paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32")
+        st.plotly_chart(grafico, use_container_width=True)
+        if np.isfinite(economia["eficacia_equilibrio"]):
+            umbral = 100 * economia["eficacia_equilibrio"]
+            st.metric("Efectividad mínima estimada para cubrir costos", f"{umbral:.1f}%" if umbral <= 100 else ">100 %")
         else:
-            st.warning("Con los supuestos seleccionados, el escenario no compensa los costos adicionales. "
-                       "Un comprador debería exigir menor costo, mayor efectividad o un piloto controlado.")
-        if r["tp_extra"] > 0 and valor > 0:
-            punto = 100 * (r["contactos_extra"] * costo + tarifa) / (r["tp_extra"] * valor)
-            st.metric("Efectividad mínima para alcanzar equilibrio", f"{punto:.1f}%" if punto <= 100 else ">100 %")
-        else:
-            st.caption("No se puede calcular un punto de equilibrio con valor neto supuesto igual a cero.")
+            st.caption("No se puede calcular el punto de equilibrio cuando el valor esperado de retención es cero.")
 
-        escenarios = pd.DataFrame({"Efectividad (%)": np.arange(0, 101, 5)})
-        escenarios["Balance incremental ($)"] = [
-            simular_diferencia_comercial(base_cm, v2_cm, e / 100, valor, costo, tarifa)["balance"]
-            for e in escenarios["Efectividad (%)"]]
-        fig = px.line(escenarios, x="Efectividad (%)", y="Balance incremental ($)", markers=True,
-                      title="Sensibilidad: cuándo se recuperaría la inversión")
-        fig.add_hline(y=0, line_dash="dash", line_color="#F0B56A")
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("No extrapolamos automáticamente los resultados de 1.409 clientes a toda una operadora. "
-                   "Las puntuaciones pueden no estar calibradas y detectar abandono no garantiza evitarlo.")
-
-    with producto:
-        st.subheader("Problema, compradores y solución")
-        st.markdown("""
-        **1. Problema de negocio.** Las operadoras pueden gastar recursos ofreciendo retención indiscriminada
-        o reaccionar tarde ante clientes que abandonarán el servicio.
-
-        **2. Producto.** NexoRetain es un prototipo de analítica predictiva y priorización comercial:
-        permite cargar clientes, estimar riesgo de churn, revisar explicaciones SHAP/LIME y exportar listas.
-
-        **3. Compradores potenciales.** Operadoras móviles, proveedores de internet y áreas de experiencia
-        del cliente, especialmente equipos de retención con capacidad de contacto limitada.
-
-        **4. Propuesta de valor.** Convertir datos de clientes en una lista de trabajo priorizada,
-        con transparencia sobre errores y costos.
-
-        **5. Valor del Machine Learning.** SVC Genético V2 alcanzó un Recall de **76.74 % en validación**
-        frente a **51.34 % del SVC base**, aunque su Precision disminuyó de 68.82 % a 54.77 %.
-
-        **6. Diferenciación propuesta.** Una experiencia que combina predicción por lotes,
-        explicabilidad individual y evaluación económica del costo de los errores.
-        No se afirma superioridad frente a soluciones comerciales externas sin una comparación directa.
-        """)
-        st.subheader("Cómo funcionaría un piloto")
-        st.markdown("""
-        1. **Preparar:** definir datos, consentimiento/base legal y variables disponibles.
-        2. **Analizar:** puntuar una muestra de cartera y proponer contactos prioritarios.
-        3. **Experimentar:** asignar aleatoriamente clientes elegibles a intervención y grupo de control.
-        4. **Medir:** comparar retención real, costos e impacto incremental de la campaña.
-        5. **Decidir:** contratar, ajustar o rechazar la solución según resultados documentados.
-        """)
-
-    with venta:
-        st.subheader("Modelo comercial propuesto")
-        planes = pd.DataFrame([
-            {"Oferta": "Piloto de evaluación", "Precio hipotético": "$300 por ciclo", "Alcance": "Carga CSV, predicción y lista priorizada"},
-            {"Oferta": "Servicio recurrente futuro", "Precio hipotético": "$800 por mes", "Alcance": "Soporte y análisis periódicos; requiere implementación"},
-            {"Oferta": "Integración empresarial futura", "Precio hipotético": "A cotizar", "Alcance": "CRM, permisos, auditoría y monitoreo: no disponibles aún"},
+    with tab_sensibilidad:
+        st.subheader("Mapa de escenarios")
+        st.write("Cada celda muestra el balance estimado al cambiar simultáneamente los contactos y la efectividad.")
+        tamaños = np.unique(np.linspace(1, len(ordenados), min(16, len(ordenados))).astype(int))
+        eficacias = np.arange(0, 101, 5)
+        acumuladas = np.cumsum(ordenados["P_Abandono"].to_numpy(dtype=float))
+        mapa = np.array([
+            [acumuladas[n - 1] * (e / 100) * valor - (n * costo + costo_fijo)
+             for n in tamaños] for e in eficacias
         ])
-        st.dataframe(planes, hide_index=True, use_container_width=True)
-        st.caption("**7. Ingresos:** precios exclusivamente ilustrativos para la propuesta académica. "
-                   "No se ha verificado demanda ni disposición real de pago.")
-        st.subheader("Riesgos que debemos comunicar")
-        st.markdown("""
-        **8. Limitaciones y mitigaciones:**
+        figura = go.Figure(go.Heatmap(
+            z=mapa, x=tamaños, y=eficacias, colorscale="RdYlGn", zmid=0,
+            colorbar=dict(title="Balance ($)"),
+            hovertemplate="Contactos: %{x}<br>Efectividad: %{y}%<br>Balance: $%{z:,.0f}<extra></extra>"))
+        figura.add_trace(go.Scatter(x=[capacidad], y=[eficacia_pct], mode="markers",
+                                    name="Escenario elegido", marker=dict(size=16, color="#FFFFFF",
+                                                                          symbol="circle-open", line=dict(width=3))))
+        figura.update_layout(template="plotly_dark", height=480,
+                             xaxis_title="Contactos por campaña", yaxis_title="Efectividad supuesta (%)",
+                             paper_bgcolor="#0B1324", plot_bgcolor="#0F1D32",
+                             legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(figura, use_container_width=True)
+        st.caption("Colores cálidos indican balance estimado negativo; los verdes, positivo. "
+                   "El anillo blanco representa la configuración actual.")
 
-        - **Falsas alarmas:** pueden generar contactos o descuentos innecesarios; controlar el costo por intervención.
-        - **Abandonos no detectados:** algunos clientes no serán priorizados; mantener canales de atención generales.
-        - **Cambio de población:** probar, recalibrar y monitorear antes de operar con una cartera nueva.
-        - **Privacidad:** los datos reales requerirían controles de acceso, políticas de conservación y evaluación legal.
-        - **Efectividad comercial:** validar las ofertas con un grupo de control; el modelo predice riesgo, no causalidad ni respuesta a incentivos.
-        - **Madurez técnica:** esta versión es un MVP académico sin usuarios, CRM, auditoría ni despliegue empresarial seguro.
-        """)
-        st.subheader("Preguntas difíciles del comprador")
-        with st.expander("¿Por qué seleccionó el SVC genético V2?"):
-            st.write("Porque en validación detectó más abandonos y alcanzó mayor F1 que el SVC base. "
-                     "El costo son 150 falsas alarmas adicionales; no todos los negocios preferirán ese intercambio.")
-        with st.expander("¿Cómo puedo confiar en las predicciones?"):
-            st.write("Se muestran matrices y métricas de validación, resultados separados de test, "
-                     "y explicaciones SHAP/LIME. Antes de producción se requiere evaluar el modelo en la empresa compradora.")
-        with st.expander("¿Qué pasa si no hay retorno económico?"):
-            st.write("El piloto debe tener indicadores y un criterio de decisión acordados. "
-                     "Si no hay mejora incremental suficiente, proponemos ajustar o no contratar.")
+    with tab_clientes:
+        st.subheader("Lista preparada para el equipo de retención")
+        columnas_vista = [c for c in ["customerID", "P_Abandono", "Prioridad", "Accion sugerida",
+                                        "Contract", "tenure", "MonthlyCharges", "Valor esperado ($)"]
+                           if c in seleccionados.columns]
+        st.dataframe(seleccionados[columnas_vista], hide_index=True, use_container_width=True)
+        st.download_button("⬇️ Descargar contactos de esta campaña", descargar_csv(seleccionados),
+                           "campana_nexoretain.csv", "text/csv", type="primary")
+        resumen = pd.DataFrame([{
+            "Contactos": capacidad, "Efectividad supuesta (%)": eficacia_pct,
+            "Valor por retención ($)": valor, "Costo por contacto ($)": costo,
+            "Costo fijo ($)": costo_fijo, "Retenciones estimadas": round(economia["retenidos"], 2),
+            "Costo total ($)": round(economia["costos"], 2),
+            "Balance proyectado ($)": round(economia["balance"], 2),
+        }])
+        st.download_button("Descargar resumen económico", descargar_csv(resumen),
+                           "resumen_campana_nexoretain.csv", "text/csv")
+
+    with st.expander("Interpretación y condiciones de uso"):
+        st.write("Este cálculo combina las puntuaciones de abandono con una efectividad comercial introducida "
+                 "manualmente. Los scores pueden no estar calibrados para una nueva empresa. "
+                 "La efectividad real y el impacto incremental deben medirse con campañas y grupos de control. "
+                 "La aplicación todavía no realiza envíos automáticos, integración CRM ni seguimiento de resultados.")
