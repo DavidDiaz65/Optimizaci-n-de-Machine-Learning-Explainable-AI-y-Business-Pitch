@@ -6,3 +6,8 @@ scikit-learn==1.7.2
 joblib
 shap
 lime
+pygad
+optuna
+matplotlib
+seaborn
+ipykernel
